@@ -209,3 +209,136 @@ Hermes →（委托/step token）→ MCP 网关 → 验 token + 策略允许 →
 - **范围**：单实现计划可覆盖「网关 + 中心集成 + Hermes 编排改造 + Runner 可选 + Langfuse 自托管与 SDK 接入」；若一期仅上网关与 token，Runner 与网关侧 Span 可作为二期。  
 - **歧义消除**：「智能体永远走 token」定义为经权限中心签发的委托/step token，经 MCP 企业网关校验；非 Hermes 自建长期 API Key 直连接口。  
 - **可观测性**：Langfuse 为**排障与质量**主用；合规举证仍以权限中心/网关**审计日志**为准；二者通过 `correlation_id` / `session_id` / `approval_id` 对齐。
+
+---
+
+## 11. 架构图
+
+### 11.1 组件全景
+
+```mermaid
+flowchart LR
+  subgraph User["用户侧"]
+    U["企业员工<br/>(Browser / CLI / TUI / Gateway)"]
+  end
+  subgraph Identity["身份与权限 (控制面)"]
+    IdP["IdP<br/>OIDC"]
+    AZ["权限中心 AuthZ Hub<br/>OIDC · OAuth2 · OPA/OpenFGA<br/>Token Service · Audit"]
+    AP["审批服务<br/>角色路由 · 会签/二次确认<br/>approval_id + 执行许可"]
+  end
+  subgraph Orchestration["智能体编排 (Hermes 信任域)"]
+    H["Hermes Server<br/>对话循环 · 工具分发<br/>不持久化企业明文密钥"]
+  end
+  subgraph DataPlane["企业数据面"]
+    GW["MCP 企业网关<br/>验 token · 策略二次判定<br/>审批门禁 · 限流 · 脱敏 · 审计"]
+    MCP1["MCP Server A (HTTP/SSE)"]
+    MCP2["MCP Server B (stdio → worker)"]
+    BIZ["后端业务系统 / 数据源"]
+  end
+  subgraph ExecPlane["执行面 (可选加强)"]
+    R["隔离 Runner<br/>容器/VM · 资源上限<br/>fail-closed egress"]
+  end
+  subgraph Observability["可观测平面"]
+    LF["Langfuse (自托管优先)<br/>Trace · Generation · Span<br/>关联: session/correlation/user/approval"]
+  end
+  U -->|OIDC 登录| IdP
+  IdP --> AZ
+  U -->|会话| H
+  H <-->|会话委托令牌| AZ
+  H -->|工具调用 携带 token| GW
+  H <-->|审批工单 approval_id| AP
+  AP <--> AZ
+  GW -->|introspection / JWKS| AZ
+  GW --> MCP1
+  GW --> MCP2
+  MCP1 --> BIZ
+  MCP2 --> BIZ
+  H -. 可选：高风险执行 .-> R
+  R -->|同体系 token 经网关| GW
+  H -. Trace/Span .-> LF
+  GW -. 可选 Span (traceparent) .-> LF
+  R  -. 可选 Span .-> LF
+```
+
+### 11.2 读路径（无审批）
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as 用户
+  participant H as Hermes
+  participant AZ as 权限中心
+  participant GW as MCP 网关
+  participant M as 后端 MCP/业务
+  participant LF as Langfuse
+  U->>H: 发起对话请求
+  H->>AZ: 取/刷新会话委托令牌
+  AZ-->>H: token (user_sub, scope, TTL)
+  H->>LF: 开启 Trace
+  H->>GW: 工具调用 (Bearer token)
+  GW->>AZ: 验签/introspection
+  AZ-->>GW: 主体 + scope + 策略决策
+  GW->>M: 转发 (脱敏/限流)
+  M-->>GW: 结果
+  GW-->>H: 结果 (脱敏)
+  GW->>LF: 可选 Span
+  H->>LF: 工具 Span 结束
+  H-->>U: 对话回答
+```
+
+### 11.3 高风险写 + 人工审批
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant H as Hermes
+  participant GW as MCP 网关
+  participant AZ as 权限中心
+  participant AP as 审批服务
+  participant R as 审批人
+  participant M as 后端 MCP/业务
+  participant LF as Langfuse
+  H->>GW: 写操作调用 (token + 参数)
+  GW->>AZ: 策略判定
+  AZ-->>GW: requires_approval=true
+  GW-->>H: APPROVAL_REQUIRED + approval_id
+  H->>LF: Tag: approval_required
+  GW->>AP: 创建工单 (tool, args_hash, user)
+  AP->>R: 路由通知 (单签/会签/二次确认)
+  R-->>AP: approved / rejected / expired
+  AP-->>H: 状态回调
+  alt approved
+    AP-->>GW: 执行许可 (绑定 args_hash, 时间窗)
+    H->>GW: 重试 (token + approval_id)
+    GW->>GW: 校验许可 + 参数摘要一致
+    GW->>M: 执行
+    M-->>GW: 结果
+    GW-->>H: 成功
+    H->>LF: Tag: approved, approval_id
+  else 拒绝/超时/参数漂移
+    GW-->>H: POLICY_DENY / APPROVAL_INVALID
+    H->>LF: Tag: rejected
+  end
+```
+
+### 11.4 关联 ID 与三类落库
+
+```mermaid
+flowchart TB
+  subgraph Keys["关联 ID 空间"]
+    SID["session_id"]
+    CID["correlation_id"]
+    UID["user_sub / user_ref (哈希)"]
+    AID["approval_id"]
+    PID["policy_revision / rule_id"]
+  end
+  subgraph Sinks["三类落库，用同一套 ID 对齐"]
+    AUD["权限中心/网关 审计日志 (合规举证)"]
+    LFX["Langfuse Trace (排障与质量)"]
+    LOG["Hermes 本地结构化日志 (运行诊断)"]
+  end
+  Keys --> AUD
+  Keys --> LFX
+  Keys --> LOG
+```
+

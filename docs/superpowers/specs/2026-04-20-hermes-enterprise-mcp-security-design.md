@@ -2,7 +2,7 @@
 
 **状态**：已评审（brainstorming 三节确认）  
 **日期**：2026-04-20  
-**范围**：单租户部署；组织内用户数据权限不同；智能体侧 MCP 调用统一走权限中心令牌；高风险写操作人工审批（按角色配置审批链/二次确认）。
+**范围**：单租户部署；组织内用户数据权限不同；智能体侧 MCP 调用统一走权限中心令牌；高风险写操作人工审批（按角色配置审批链/二次确认）；**可观测性通过 Langfuse 汇聚**（LLM 追踪、工具/MCP 跨度、与审计 ID 关联）。
 
 ---
 
@@ -21,6 +21,7 @@
 3. **A + B 收敛**：用户直连凭据与服务账号 + OBO 的差异**只在权限中心内部**消化；对 Hermes 暴露为同一种「带范围、可审计的调用凭证」。
 4. **人工审批**：覆盖**高风险写操作**；审批人/会签/二次确认**按角色与组织**配置。
 5. **沙箱**：企业数据面走 token + MCP 网关策略；不可信执行（代码/命令/浏览器等）走隔离 Runner，默认 fail-closed 出网策略。
+6. **可观测性（Langfuse）**：将 **对话轮次、模型调用、工具/MCP 调用、延迟与错误** 以统一 Trace 汇聚到 Langfuse；与 `session_id`、`correlation_id`、`user_sub`（或企业内用户哈希）、`approval_id` **可关联查询**；支持自托管部署以满足数据驻留；**不向 Langfuse 写入令牌、密钥、完整未脱敏 PII**（见 §4.6）。
 
 ### 1.3 非目标（本规格不展开）
 
@@ -48,6 +49,7 @@
 2. **智能体编排**：Hermes Server（对话状态、工具循环；不改变「对话中途破坏 prompt 缓存」的现有约束）。
 3. **企业工具平面（数据面）**：MCP 企业网关 → 后端 MCP / 业务 API（HTTP/SSE 优先；stdio 类经 worker 包装）。
 4. **执行平面**：隔离 Runner（可选加强），承载不可信执行；若需触达企业数据，仍须走同一 MCP 网关与同体系 token。
+5. **可观测平面**：**Langfuse**（推荐 **自托管** 与企业 VPC 同域）；摄取来自 Hermes、可选来自 MCP 网关/Runner 的跨度；与权限中心审计并存——**Langfuse 偏运行与排障，审计日志偏合规举证**，二者通过相同关联 ID 串联。
 
 ---
 
@@ -90,6 +92,34 @@
 - **产物**：`approval_id` + **短时执行许可**（绑定：`tool`、规范化参数或 `arguments_hash`、时间窗、环境）。
 - **通知 Hermes**：轮询、Webhook 或消息队列；状态：`approved` / `rejected` / `expired`。
 
+### 4.6 Langfuse 与可观测性
+
+**定位**：Langfuse 作为 **LLM 与应用编排可观测性** 的聚合点（Trace / Generation / Span / Score），补齐「只看审计日志不够排障」的缺口；**不替代**权限中心与网关的合规审计。
+
+**部署**：默认 **企业自托管 Langfuse**（与 Hermes、网关同安全域或受控出站）；若使用 Langfuse Cloud，须经企业安全评估与 DPA，并满足数据驻留要求。
+
+**摄取范围（建议）**
+
+| 来源 | 建议事件/跨度 | 备注 |
+|------|----------------|------|
+| Hermes | `trace` = 一次用户任务或会话内连续轮次；子 Span：每次 `chat.completions`、每次工具调用 | 与 OpenTelemetry trace context 或 Langfuse SDK 对齐 |
+| MCP 企业网关（可选） | 出站 MCP 调用 Span：工具名、延迟、状态码、**参数/响应摘要或哈希** | 完整 body 默认不上传；敏感字段脱敏 |
+| Runner（可选） | 执行类 Span：镜像/资源 ID、时长、退出码 | 不传宿主路径与密钥 |
+
+**关联 ID（强制约定）**
+
+- 每条 Trace 携带：`session_id`、`correlation_id`（或等价 request id）、`user_sub` 或经哈希的 `user_ref`（禁止仅依赖邮箱明文若策略不允许）。
+- 命中审批时写入 `approval_id`、`policy_hit`（策略规则 id 或摘要）。
+- 与 **权限中心审计**、**网关审计** 使用相同 ID 空间或可查询映射，便于「一次事故 → 三处日志对齐」。
+
+**隐私与安全**
+
+- **禁止**上报：访问令牌、refresh token、API Key、`Authorization` 头、step token 明文。
+- **Prompt/Completion**：按企业分级脱敏或截断；默认可对工具返回中的表格/PII 做 redaction 后再入 Langfuse。
+- **采样与留存**：配置采样率、TTL 与导出策略；高敏环境可仅保留 **元数据 Trace**（无正文）。
+
+**运维**：监控 Langfuse 写入失败应 **降级为仅本地日志**，不得阻塞对话主路径；可选异步队列削峰。
+
 ---
 
 ## 5. 数据流
@@ -113,6 +143,14 @@ Hermes →（委托/step token）→ MCP 网关 → 验 token + 策略允许 →
 
 - Hermes 侧不区分 A/B；令牌均由权限中心体系签发。  
 - 中心内部：A 为用户授权链托管；B 为服务账号仅中心可见，对外仅 OBO/委托 token，并审计「代表用户 U」。
+
+### 5.5 可观测性数据流（Langfuse）
+
+1. 用户请求进入 Hermes → 创建或继承 **根 Trace**（写入 `session_id`、`correlation_id`、`user_ref`）。  
+2. 每次模型调用 → **Generation**（模型名、token 用量、延迟、错误；正文按策略脱敏）。  
+3. 每次工具/MCP 调用 → **Span**（工具名、成功/失败、耗时；参数/结果摘要或哈希）。  
+4. 审批分支 → 在 Trace 上打标签或 Span：`approval_required`、`approval_id`、`approved/rejected`。  
+5. （可选）MCP 网关在出站前后各打 **子 Span** 或通过 W3C `traceparent` 与 Hermes 共用同一 Trace，便于端到端延迟分解。
 
 ---
 
@@ -153,13 +191,14 @@ Hermes →（委托/step token）→ MCP 网关 → 验 token + 策略允许 →
 3. **令牌**：过期/吊销不可用；scope 收窄后不可扩权回退。  
 4. **审计**：企业写操作可追溯 `who/when/what/policy_revision/approval_id`。  
 5. **执行面**：Runner 默认无任意公网渗出；允许的 egress 有审计。  
-6. **韧性**：依赖故障时符合 fail-closed 预期。
+6. **韧性**：依赖故障时符合 fail-closed 预期。  
+7. **Langfuse**：任一完整对话任务在 Langfuse 中可检索到对应 Trace；`correlation_id` 与审计日志可交叉验证；**抽检确认**无令牌/密钥进入 Langfuse payload；Langfuse 不可用时 Hermes **仍可完成对话**（观测降级）。
 
 ---
 
 ## 9. 后续工作入口
 
-本文件为**设计规格**。实施前应由维护者基于本规格编写 **implementation plan**（文件级变更、网关协议、Hermes 挂钩点、迁移与回滚），并单独走代码评审与测试计划。
+本文件为**设计规格**。实施前应由维护者基于本规格编写 **implementation plan**（文件级变更、网关协议、Hermes 挂钩点、**Langfuse SDK/OTLP 接入点**、迁移与回滚），并单独走代码评审与测试计划。
 
 ---
 
@@ -167,5 +206,6 @@ Hermes →（委托/step token）→ MCP 网关 → 验 token + 策略允许 →
 
 - **占位符**：无 TBD/TODO。  
 - **一致性**：单租户多用户、统一 token 面、网关唯一数据面入口、审批仅高风险写，与全文一致。  
-- **范围**：单实现计划可覆盖「网关 + 中心集成 + Hermes 编排改造 + Runner 可选」；若一期仅上网关与 token，Runner 可作为二期。  
-- **歧义消除**：「智能体永远走 token」定义为经权限中心签发的委托/step token，经 MCP 企业网关校验；非 Hermes 自建长期 API Key 直连接口。
+- **范围**：单实现计划可覆盖「网关 + 中心集成 + Hermes 编排改造 + Runner 可选 + Langfuse 自托管与 SDK 接入」；若一期仅上网关与 token，Runner 与网关侧 Span 可作为二期。  
+- **歧义消除**：「智能体永远走 token」定义为经权限中心签发的委托/step token，经 MCP 企业网关校验；非 Hermes 自建长期 API Key 直连接口。  
+- **可观测性**：Langfuse 为**排障与质量**主用；合规举证仍以权限中心/网关**审计日志**为准；二者通过 `correlation_id` / `session_id` / `approval_id` 对齐。

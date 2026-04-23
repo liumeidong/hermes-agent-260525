@@ -27,6 +27,8 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import httpx
 
+from agent.gemini_schema import sanitize_gemini_tool_parameters
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -253,7 +255,7 @@ def _translate_tools_to_gemini(tools: Any) -> List[Dict[str, Any]]:
             decl["description"] = description
         parameters = fn.get("parameters")
         if isinstance(parameters, dict):
-            decl["parameters"] = parameters
+            decl["parameters"] = sanitize_gemini_tool_parameters(parameters)
         declarations.append(decl)
     return [{"functionDeclarations": declarations}] if declarations else []
 
@@ -611,7 +613,8 @@ def gemini_http_error(response: httpx.Response) -> GeminiAPIError:
         err_obj = {}
     err_status = str(err_obj.get("status") or "").strip()
     err_message = str(err_obj.get("message") or "").strip()
-    details_list = err_obj.get("details") if isinstance(err_obj.get("details"), list) else []
+    _raw_details = err_obj.get("details")
+    details_list = _raw_details if isinstance(_raw_details, list) else []
 
     reason = ""
     retry_after: Optional[float] = None

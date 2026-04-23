@@ -108,9 +108,15 @@ def _run_async(coro):
     if loop and loop.is_running():
         # Inside an async context (gateway, RL env) — run in a fresh thread.
         import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, coro)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(asyncio.run, coro)
+        try:
             return future.result(timeout=300)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     # If we're on a worker thread (e.g., parallel tool execution in
     # delegate_task), use a per-thread persistent loop.  This avoids
@@ -547,6 +553,30 @@ def handle_function_call(
                 session_id=session_id or "",
                 tool_call_id=tool_call_id or "",
             )
+        except Exception:
+            pass
+
+        # Generic tool-result canonicalization seam: plugins receive the
+        # final result string (JSON, usually) and may replace it by
+        # returning a string from transform_tool_result. Runs after
+        # post_tool_call (which stays observational) and before the result
+        # is appended back into conversation context. Fail-open; the first
+        # valid string return wins; non-string returns are ignored.
+        try:
+            from hermes_cli.plugins import invoke_hook
+            hook_results = invoke_hook(
+                "transform_tool_result",
+                tool_name=function_name,
+                args=function_args,
+                result=result,
+                task_id=task_id or "",
+                session_id=session_id or "",
+                tool_call_id=tool_call_id or "",
+            )
+            for hook_result in hook_results:
+                if isinstance(hook_result, str):
+                    result = hook_result
+                    break
         except Exception:
             pass
 

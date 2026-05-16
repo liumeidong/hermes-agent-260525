@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python apply_translations.py)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

@@ -1,20 +1,100 @@
-"""Automatic context window compression for long conversations.
+"""对话上下文自动压缩 — 长会话的"记忆压缩"机制。
 
-Self-contained class with its own OpenAI client for summarization.
-Uses auxiliary model (cheap/fast) to summarize middle turns while
-protecting head and tail context.
+================================================================================
+设计动机
+================================================================================
+LLM 的上下文窗口有限（如 128K/200K tokens）。长对话会积累大量消息——
+工具调用参数、工具返回结果、多轮思考——很快超出窗口限制，导致 API 调用失败。
 
-Improvements over v2:
-  - Structured summary template with Resolved/Pending question tracking
-  - Summarizer preamble: "Do not respond to any questions" (from OpenCode)
-  - Handoff framing: "different assistant" (from Codex) to create separation
-  - "Remaining Work" replaces "Next Steps" to avoid reading as active instructions
-  - Clear separator when summary merges into tail message
-  - Iterative summary updates (preserves info across multiple compactions)
-  - Token-budget tail protection instead of fixed message count
-  - Tool output pruning before LLM summarization (cheap pre-pass)
-  - Scaled summary budget (proportional to compressed content)
-  - Richer tool call/result detail in summarizer input
+ContextCompressor 的解决思路：
+  - 在超限前自动压缩"中间"的对话轮次
+  - 用 LLM 将中间轮次总结为结构化摘要
+  - 保护头部（system prompt + 最早几轮）和尾部（最近 N 轮）
+  - 压缩后消息数大幅减少，token 消耗回到阈值以下
+
+================================================================================
+压缩算法（5 阶段）
+================================================================================
+
+Phase 1: 工具结果裁剪（零 LLM 调用，纯本地计算）
+  - 旧工具返回值替换为 1 行摘要，如：
+    [terminal] ran `npm test` -> exit 0, 47 lines output
+    [read_file] read config.py from line 1 (3,400 chars)
+  - 相同文件被多次读取时，只保留最新一次完整内容，其余标为重复
+
+Phase 2: 边界定位
+  - 头部保护: 前 N 条消息不动（默认 3 条）
+  - 尾部保护: 按 token 预算从后往前累积消息（默认 threshold * 0.20）
+  - 边界对齐: 不切断 tool_call/result 配对
+
+Phase 3: LLM 摘要生成
+  - 使用辅助模型（便宜/快速）生成结构化摘要
+  - 模板包含: Active Task, Goal, Completed Actions, Active State,
+    In Progress, Blocked, Key Decisions, Resolved Questions,
+    Pending User Asks, Relevant Files, Remaining Work, Critical Context
+  - 首次压缩: 从零总结
+  - 后续压缩: 在已有摘要基础上迭代更新（增量合并）
+
+Phase 4: 消息组装
+  - 头消息 → 摘要消息 → 尾消息
+  - 修复孤立的 tool_call/result 配对
+  - 在 system prompt 中注入压缩提示
+
+Phase 5: 会话拆分（run_agent.py 负责）
+  - SQLite 中 end_session(old_id, "compression")
+  - 创建新 session，通过 parent_session_id 链式连接
+  - 标题自动编号: "my session" → "my session #2"
+
+================================================================================
+关键设计决策
+================================================================================
+
+Token-budget 尾部保护:
+  使用 token_budget（默认 context_length * 0.20）而非固定消息数来
+  决定尾部保留多少条消息。大型上下文窗口的模型会保留更多上下文。
+
+迭代摘要更新:
+  首次压缩从零总结；之后每次压缩将新的中间轮次合并到已有摘要中。
+  避免了重复总结同一段历史——节省 token 且保持信息连续性。
+
+结构化摘要模板:
+  不是自由文本，而是有固定段落的结构化输出。确保关键信息
+  (Active Task, Pending User Asks, Relevant Files) 不丢失。
+
+反抖动保护 (Anti-thrashing):
+  如果连续 2 次压缩各节省 <10%，说明压缩已无效——跳过后续压缩，
+  提示用户执行 /new 或 /compress <topic>。
+
+模型回退:
+  如果配置的辅助摘要模型不可用 (404/503/"model_not_found")，
+  自动回退到主模型。避免压缩功能整体不可用。
+
+================================================================================
+Compression algorithm (5 phases in English):
+
+Phase 1: Tool output pruning (zero LLM calls, purely local)
+  - Replace old tool results with 1-line summaries
+  - Deduplicate identical tool results, keeping only the newest
+
+Phase 2: Boundary determination
+  - Head protection: first N messages untouched (default 3)
+  - Tail protection: walk backward accumulating tokens until budget exhausted
+  - Boundary alignment: don't split tool_call/result pairs
+
+Phase 3: LLM summarization
+  - Use auxiliary model (cheap/fast) for structured summary
+  - Structured template: Active Task, Goal, Completed Actions, etc.
+  - First compression: summarize from scratch
+  - Subsequent: iteratively update previous summary
+
+Phase 4: Message assembly
+  - head messages → summary message → tail messages
+  - Sanitize orphaned tool_call/result pairs
+  - Inject compression note into system prompt
+
+Phase 5: Session splitting (handled by run_agent.py)
+  - SQLite: end old session, create new with parent_session_id chain
+  - Auto-number titles: "my session" → "my session #2"
 """
 
 import hashlib
@@ -35,6 +115,17 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# 摘要前缀 — 注入到压缩后的消息列表中，告诉模型"这是摘要，不是指令"
+# ============================================================================
+# 关键设计：
+#   - 显式声明"handoff from a previous context window"，制造"不是同一个助手"的
+#     心理框架（借鉴 Codex 的 "different assistant" 模式）
+#   - "Do NOT answer questions" — 防止模型把摘要中已解决的问题重新回答一遍
+#     （借鉴 OpenCode 的 "Do not respond to any questions" 模式）
+#   - "Respond ONLY to the latest user message" — 将注意力引导到最新的
+#     真实用户消息，而非摘要内容
+#   - 摘要前导内容 + SUMMARY_PREFIX 共同构成了压缩后的"上下文交接"协议
 SUMMARY_PREFIX = (
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
     "into the summary below. This is a handoff from a previous context "
@@ -47,20 +138,31 @@ SUMMARY_PREFIX = (
     "that appears AFTER this summary. The current session state (files, "
     "config, etc.) may reflect work described here — avoid repeating it:"
 )
+# 旧版摘要前缀 — 用于向后兼容地识别旧格式摘要
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
-# Minimum tokens for the summary output
+# ---------------------------------------------------------------------------
+# 摘要 token 预算控制
+# ---------------------------------------------------------------------------
+# 摘要的最少输出 token 数 — 太小了信息量不足，无法支撑后续工作
 _MIN_SUMMARY_TOKENS = 2000
-# Proportion of compressed content to allocate for summary
+# 摘要占被压缩内容的比例 — 被压缩的内容越多，摘要预算越高
 _SUMMARY_RATIO = 0.20
-# Absolute ceiling for summary tokens (even on very large context windows)
+# 摘要 token 的绝对上限 — 即使上下文窗口很大（如 200K），摘要也不能太长
+# 摘要本身也占用上下文窗口中的空间
 _SUMMARY_TOKENS_CEILING = 12_000
 
-# Placeholder used when pruning old tool results
+# 工具结果裁剪时的占位符（旧版，现在用 _summarize_tool_result 替代）
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
-# Chars per token rough estimate
+# ---------------------------------------------------------------------------
+# 其他常量
+# ---------------------------------------------------------------------------
+# 粗略的每 token 字符数估计 — 用于快速 token 计数（非精确）
+# Python/英文约 4 chars/token，中文约 2 chars/token，取 4 作为保守估计
 _CHARS_PER_TOKEN = 4
+# 摘要失败后的冷却时间（秒）— 避免对不可达的 API 端点连续重试
+# 600 秒 = 10 分钟，足够让瞬态故障（网络波动、限流）恢复
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
 
@@ -274,22 +376,47 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
 
 
 class ContextCompressor(ContextEngine):
-    """Default context engine — compresses conversation context via lossy summarization.
+    """默认上下文引擎 — 通过有损摘要压缩对话上下文。
 
-    Algorithm:
-      1. Prune old tool results (cheap, no LLM call)
-      2. Protect head messages (system prompt + first exchange)
-      3. Protect tail messages by token budget (most recent ~20K tokens)
-      4. Summarize middle turns with structured LLM prompt
-      5. On subsequent compactions, iteratively update the previous summary
+    核心算法（5 个阶段）:
+      1. 工具结果裁剪 — 旧的工具返回值替换为 1 行摘要，不调用 LLM
+      2. 头部保护 — system prompt + 前几轮对话不变
+      3. 尾部保护 — 按 token 预算保留最近的消息（约 20% 上下文窗口）
+      4. LLM 摘要生成 — 用结构化 prompt 让辅助模型总结中间轮次
+      5. 迭代更新 — 后续压缩在已有摘要基础上增量合并，而非从头总结
+
+    反抖动保护：
+      连续 2 次压缩各节省 <10% 时，跳过后续压缩，防止无效压缩死循环。
+
+    会话生命周期：
+      - /new 或 /reset 时调用 on_session_reset() 清除所有会话状态
+      - 模型切换时调用 update_model() 重新计算上下文窗口相关参数
+      - 每次 API 响应后 update_from_response() 更新 token 计数
+      - should_compress() 判断是否需要触发压缩
+      - compress() 执行实际压缩
+
+    Attributes:
+        threshold_percent: 触发压缩的阈值比例 (默认 50%，即上下文窗口用了一半时触发)
+        protect_first_n: 头部保护的消息数 (默认 3)
+        protect_last_n: 尾部保护的硬最小消息数 (默认 20)
+        summary_target_ratio: 尾部 token 预算占阈值的比例 (默认 0.20)
+        _previous_summary: 上次压缩的摘要文本，用于迭代更新
+        _ineffective_compression_count: 连续无效压缩计数（反抖动）
     """
 
     @property
     def name(self) -> str:
+        """引擎名称标识 — 用于 config.yaml 中 context.engine 选择。"""
         return "compressor"
 
     def on_session_reset(self) -> None:
-        """Reset all per-session state for /new or /reset."""
+        """重置所有会话级状态 — /new 或 /reset 时调用。
+
+        清除内容：
+          - _context_probed: 上下文探测标志（API 返回 context_length_exceeded 后设为 True）
+          - _previous_summary: 上一次的压缩摘要（/reset 后应该重新开始）
+          - 压缩效果追踪: 节省比例和无效计数归零
+        """
         super().on_session_reset()
         self._context_probed = False
         self._context_probe_persistable = False
@@ -306,7 +433,13 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
     ) -> None:
-        """Update model info after a model switch or fallback activation."""
+        """模型切换或回退激活后更新模型信息。
+
+        重新计算：
+          - context_length: 模型上下文窗口大小
+          - threshold_tokens: 压缩触发阈值 = max(context_length * threshold_percent, MINIMUM_CONTEXT_LENGTH)
+            例如：200K * 0.50 = 100K 时触发压缩
+        """
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
@@ -320,48 +453,59 @@ class ContextCompressor(ContextEngine):
 
     def __init__(
         self,
-        model: str,
-        threshold_percent: float = 0.50,
-        protect_first_n: int = 3,
-        protect_last_n: int = 20,
-        summary_target_ratio: float = 0.20,
-        quiet_mode: bool = False,
-        summary_model_override: str = None,
-        base_url: str = "",
-        api_key: str = "",
-        config_context_length: int | None = None,
-        provider: str = "",
-        api_mode: str = "",
+        model: str,                         # 主 LLM 模型名（用于获取上下文窗口大小）
+        threshold_percent: float = 0.50,     # 触发阈值: 占用上下文窗口的比例（0.50 = 50%）
+        protect_first_n: int = 3,           # 头部保护的消息数（含 system prompt）
+        protect_last_n: int = 20,           # 尾部硬最小保护消息数（token 预算优先）
+        summary_target_ratio: float = 0.20, # 尾部 token 预算占阈值的比例
+        quiet_mode: bool = False,           # 静默模式，减少日志输出
+        summary_model_override: str = None, # 强制指定摘要模型（None = 使用主模型）
+        base_url: str = "",                 # API base URL
+        api_key: str = "",                  # API key
+        config_context_length: int | None = None,  # 用户配置覆盖的上下文窗口大小
+        provider: str = "",                 # LLM 提供商
+        api_mode: str = "",                 # API 模式
     ):
+        # ---- 基本身份 ----
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
         self.provider = provider
         self.api_mode = api_mode
+
+        # ---- 压缩参数 ----
         self.threshold_percent = threshold_percent
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
+        # summary_target_ratio 限制在 [0.10, 0.80] — 至少保留 10% 作为尾部，最多 80%
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
 
+        # ---- 上下文窗口大小 ----
+        # 从模型元数据获取上下文窗口长度，支持用户配置覆盖
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
             config_context_length=config_context_length,
             provider=provider,
         )
-        # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
-        # the percentage would suggest a lower value.  This prevents premature
-        # compression on large-context models at 50% while keeping the % sane
-        # for models right at the minimum.
+        # 压缩触发阈值（token 数）
+        # 例如 200K 上下文 × 50% = 100K 时触发压缩
+        # 下限保护: 即使模型上下文很小，阈值不低于 MINIMUM_CONTEXT_LENGTH
+        # 这防止了在大上下文窗口模型上过早触发压缩（50% 依然合理），
+        # 同时对刚好达到最小值的模型保持百分比合理
         self.threshold_tokens = max(
             int(self.context_length * threshold_percent),
             MINIMUM_CONTEXT_LENGTH,
         )
         self.compression_count = 0
 
-        # Derive token budgets: ratio is relative to the threshold, not total context
+        # ---- 推导 token 预算 ----
+        # 尾部 token 预算: 基于阈值（不是总上下文）来计算
+        # 例如 threshold=100K, ratio=0.20 → tail_token_budget=20K tokens
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
+        # 摘要输出上限: 上下文窗口的 5% 或 _SUMMARY_TOKENS_CEILING (12K) 中较小值
+        # 原因：摘要本身也占用上下文空间，不能太大
         self.max_summary_tokens = min(
             int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
         )
@@ -376,18 +520,25 @@ class ContextCompressor(ContextEngine):
                 self.tail_token_budget,
                 provider or "none", base_url or "none",
             )
-        self._context_probed = False  # True after a step-down from context error
+        # ---- 运行时状态 ----
+        # 上下文探测标志: API 返回 context_length_exceeded 错误后设为 True，
+        # 表示实际上下文窗口可能比元数据声称的小
+        self._context_probed = False
 
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
 
+        # 摘要模型：如果未指定，使用主模型
         self.summary_model = summary_model_override or ""
 
-        # Stores the previous compaction summary for iterative updates
+        # ---- 迭代摘要状态 ----
+        # 存储上一次压缩的完整摘要文本，用于后续压缩的增量更新
         self._previous_summary: Optional[str] = None
-        # Anti-thrashing: track whether last compression was effective
+        # ---- 反抖动追踪 ----
+        # 上次压缩的 token 节省百分比；连续 <10% 的压缩累计无效计数
         self._last_compression_savings_pct: float = 100.0
         self._ineffective_compression_count: int = 0
+        # 摘要失败冷却: 避免对不可达的 API 端点连续重试
         self._summary_failure_cooldown_until: float = 0.0
 
     def update_from_response(self, usage: Dict[str, Any]):
@@ -396,16 +547,26 @@ class ContextCompressor(ContextEngine):
         self.last_completion_tokens = usage.get("completion_tokens", 0)
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
-        """Check if context exceeds the compression threshold.
+        """检查是否需要触发上下文压缩。
 
-        Includes anti-thrashing protection: if the last two compressions
-        each saved less than 10%, skip compression to avoid infinite loops
-        where each pass removes only 1-2 messages.
+        判断逻辑：
+          1. 当前 prompt_tokens 是否超过 threshold_tokens（默认 50% 上下文窗口）
+          2. 反抖动保护：如果连续 2 次压缩各节省 <10%，跳过
+
+        为什么在 50% 时触发而不是 90%？
+          - 压缩本身需要额外 LLM 调用，需要时间
+          - 如果等到 90% 才压缩，下一次 API 调用可能超出 100% 导致失败
+          - 50% 给了充足的缓冲空间
+
+        为什么 10% 节省算无效？
+          - 如果每次压缩只能移除 1-2 条消息，说明对话结构过于紧密
+            （大量短轮次相互依赖），压缩无法有效缩减
+          - 此时继续压缩只会浪费 LLM 调用费用，建议用户手动 /new 或 /compress <topic>
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens < self.threshold_tokens:
             return False
-        # Anti-thrashing: back off if recent compressions were ineffective
+        # 反抖动保护: 连续 2 次压缩无效时停止
         if self._ineffective_compression_count >= 2:
             if not self.quiet_mode:
                 logger.warning(
@@ -418,31 +579,31 @@ class ContextCompressor(ContextEngine):
         return True
 
     # ------------------------------------------------------------------
-    # Tool output pruning (cheap pre-pass, no LLM call)
+    # Phase 1: 工具结果裁剪 — 零 LLM 调用，纯本地去重 + 摘要化
     # ------------------------------------------------------------------
+    # 这是压缩前最便宜的预处理步骤，不做任何 LLM 调用：
+    #   Pass 1: 去重 — 相同文件被多次读取时，只保留最新完整内容
+    #   Pass 2: 摘要化 — 旧工具结果替换为 1 行描述（如 [terminal] ran `npm test` -> exit 0）
+    #   Pass 3: 参数截断 — 旧 assistant 消息中过大的 tool_call arguments 截断
 
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
     ) -> tuple[List[Dict[str, Any]], int]:
-        """Replace old tool result contents with informative 1-line summaries.
+        """将旧的工具返回值替换为 1 行信息摘要。
 
-        Instead of a generic placeholder, generates a summary like::
+        三种操作：
+          Pass 1 — 去重: 相同内容的工具结果只保留最新一份，旧版本标记为 [Duplicate...]
+          Pass 2 — 摘要化: 尾部边界之前的旧工具结果（>200 chars）替换为 1 行描述
+          Pass 3 — 参数截断: 旧 assistant 消息中 >500 chars 的 tool_call arguments 截断为 200 chars
 
-            [terminal] ran `npm test` -> exit 0, 47 lines output
-            [read_file] read config.py from line 1 (3,400 chars)
+        尾部保护:
+          - token_budget 优先: 从后往前累积 token，超过 budget 时停止
+          - protect_tail_count 作为硬最小下限
+          - 用 MD5 去重而非原文比较（避免在上下文中存两次完整输出）
 
-        Also deduplicates identical tool results (e.g. reading the same file
-        5x keeps only the newest full copy) and truncates large tool_call
-        arguments in assistant messages outside the protected tail.
-
-        Walks backward from the end, protecting the most recent messages that
-        fall within ``protect_tail_tokens`` (when provided) OR the last
-        ``protect_tail_count`` messages (backward-compatible default).
-        When both are given, the token budget takes priority and the message
-        count acts as a hard minimum floor.
-
-        Returns (pruned_messages, pruned_count).
+        返回值:
+          (pruned_messages, pruned_count): 处理后的消息列表和被修改的消息数
         """
         if not messages:
             return messages, 0
@@ -642,22 +803,48 @@ class ContextCompressor(ContextEngine):
         return "\n\n".join(parts)
 
     def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
-        """Generate a structured summary of conversation turns.
+        """[Phase 3] 用辅助 LLM 生成中间对话轮次的结构化摘要。
 
-        Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
-        Questions, Files, Remaining Work) with explicit preamble telling the
-        summarizer not to answer questions.  When a previous summary exists,
-        generates an iterative update instead of summarizing from scratch.
+        两条路径：
+          首次压缩 — 从零总结，使用完整结构化模板
+          迭代更新 — 已有 _previous_summary，只合并新增轮次
+                     保留所有仍相关的旧信息，添加新完成的动作
 
-        Args:
-            focus_topic: Optional focus string for guided compression.  When
-                provided, the summariser prioritises preserving information
-                related to this topic and is more aggressive about compressing
-                everything else.  Inspired by Claude Code's ``/compact``.
+        结构化模板（12 个段落）：
+          Active Task:       用户最新未完成的任务（最重要！下一个助手从这里继续）
+          Goal:              总体目标
+          Constraints:       用户偏好、编码风格约束
+          Completed Actions: 已完成的每个操作（含工具名、目标、结果）
+          Active State:      当前工作目录、分支、已修改文件、测试状态
+          In Progress:       正在进行的任务
+          Blocked:           阻塞原因和详细错误信息
+          Key Decisions:     技术决策及 WHY
+          Resolved Questions:已回答的问题（附答案，防止重复回答）
+          Pending User Asks: 未回答的用户问题/请求
+          Relevant Files:    涉及的文件及操作类型
+          Remaining Work:    剩余工作（作为上下文，非指令）
+          Critical Context:  必须保留的具体值（错误、配置等；不保留 API keys）
 
-        Returns None if all attempts fail — the caller should drop
-        the middle turns without a summary rather than inject a useless
-        placeholder.
+        Focus topic (引导压缩, /compress <topic>):
+          用户指定关注话题时，摘要模型会：
+            - 对相关话题保留完整细节（具体值、路径、错误信息、决策）
+            - 对不相关话题激进压缩（一行概括或直接省略）
+            - 关注话题部分占用 60-70% 摘要 token 预算
+          借鉴 Claude Code 的 /compact <focus> 模式
+
+        安全措施：
+          - 所有内容通过 redact_sensitive_text 脱敏后再发送给摘要模型
+          - 摘要输出再次脱敏（防止 LLM 忽略 prompt 指令回显密钥）
+          - preamble 中明确要求 "NEVER include API keys, tokens, passwords..."
+
+        失败处理（多层回退）：
+          1. 冷却期内跳过 (600s)
+          2. 辅助模型不可用 → 回退到主模型做摘要
+          3. 所有尝试失败 → 返回 None，调用方丢弃中间轮次不注入摘要
+                            （比注入无用占位符好）
+
+        Returns:
+            带 SUMMARY_PREFIX 的完整摘要文本，或 None
         """
         now = time.monotonic()
         if now < self._summary_failure_cooldown_until:
@@ -883,18 +1070,23 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         return getattr(tc, "id", "") or ""
 
     def _sanitize_tool_pairs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Fix orphaned tool_call / tool_result pairs after compression.
+        """[Phase 5] 修复压缩后孤立的 tool_call / tool_result 配对。
 
-        Two failure modes:
-        1. A tool *result* references a call_id whose assistant tool_call was
-           removed (summarized/truncated).  The API rejects this with
-           "No tool call found for function call output with call_id ...".
-        2. An assistant message has tool_calls whose results were dropped.
-           The API rejects this because every tool_call must be followed by
-           a tool result with the matching call_id.
+        压缩会总结或丢弃中间的 assistant 消息（含 tool_calls）或 tool 消息（结果），
+        导致两种 API 会拒绝的格式错误：
 
-        This method removes orphaned results and inserts stub results for
-        orphaned calls so the message list is always well-formed.
+        模式 1 — 孤儿 tool result:
+          tool 消息的 tool_call_id 引用的 assistant tool_call 已被压缩移除。
+          API 错误: "No tool call found for function call output with call_id ..."
+          修复: 删除这些孤儿 tool result 消息
+
+        模式 2 — 孤儿 tool call:
+          assistant 消息包含 tool_calls，但对应的 tool result 被删除/裁剪。
+          API 要求在 assistant 后的下一条消息必须是对应的 tool result。
+          修复: 为每个缺失结果插入 stub 消息：
+                "[Result from earlier conversation — see context summary above]"
+
+        这个方法是最后的安全检查——确保消息列表始终是 API 兼容的格式。
         """
         surviving_call_ids: set = set()
         for msg in messages:
@@ -1040,21 +1232,35 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self, messages: List[Dict[str, Any]], head_end: int,
         token_budget: int | None = None,
     ) -> int:
-        """Walk backward from the end of messages, accumulating tokens until
-        the budget is reached. Returns the index where the tail starts.
+        """[Phase 2] 按 token 预算从后往前确定尾部边界。
 
-        ``token_budget`` defaults to ``self.tail_token_budget`` which is
-        derived from ``summary_target_ratio * context_length``, so it
-        scales automatically with the model's context window.
+        核心策略:
+          从消息列表末尾往回走，逐条累积 token 数，直到达到预算。
+          尾部内的消息不被压缩，直接保留为原始对话。
 
-        Token budget is the primary criterion.  A hard minimum of 3 messages
-        is always protected, but the budget is allowed to exceed by up to
-        1.5x to avoid cutting inside an oversized message (tool output, file
-        read, etc.).  If even the minimum 3 messages exceed 1.5x the budget
-        the cut is placed right after the head so compression still runs.
+        预算参数:
+          token_budget 默认 = threshold_tokens × summary_target_ratio
+          例如: 100K × 0.20 = 20K tokens 的尾部
 
-        Never cuts inside a tool_call/result group.  Always ensures the most
-        recent user message is in the tail (see ``_ensure_last_user_message_in_tail``).
+        软上限策略 (soft ceiling):
+          标准预算 × 1.5 = soft_ceiling (例: 20K × 1.5 = 30K)
+          这样做的目的是避免在超大消息（如工具输出、文件读取）的
+          中间切断——允许预算超额最多 50% 来得到一个干净的边界。
+
+        多层保护:
+          1. 硬最小: 始终保护至少 3 条消息（min_tail）
+          2. 软上限: 预算允许超额 50%（避免在超大消息中间切断）
+          3. 边界对齐: 不切断 tool_call/result 分组
+          4. 用户消息锚定: 确保最新用户消息始终在尾部（#10896）
+
+        边界情况:
+          - 小会话: 如果 token 预算可以覆盖所有消息，强制在头部之后切割
+            以确保压缩仍能移除中间轮次
+          - 超大尾部: 即使最小 3 条消息也超过 soft_ceiling，
+            切割线仍放在头部之后，压缩继续运行
+
+        Returns:
+            尾部起始索引（含），即 messages[tail_idx:] 是被保护的尾部
         """
         if token_budget is None:
             token_budget = self.tail_token_budget
@@ -1104,23 +1310,35 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     # ------------------------------------------------------------------
 
     def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None) -> List[Dict[str, Any]]:
-        """Compress conversation messages by summarizing middle turns.
+        """压缩对话消息列表 — 将中间轮次替换为结构化摘要。
 
-        Algorithm:
-          1. Prune old tool results (cheap pre-pass, no LLM call)
-          2. Protect head messages (system prompt + first exchange)
-          3. Find tail boundary by token budget (~20K tokens of recent context)
-          4. Summarize middle turns with structured LLM prompt
-          5. On re-compression, iteratively update the previous summary
+        完整 5 阶段算法:
+          Phase 1: 工具结果裁剪 — 零 LLM 调用的本地去重 + 摘要化
+                   - 重复的工具结果去重（只保留最新完整内容）
+                   - 旧结果替换为 1 行描述
+                   - 旧 tool_call arguments 截断
+          Phase 2: 边界定位 — 确定头部（不压缩）和尾部（不压缩）的范围
+                   - 头部: 前 protect_first_n 条消息（默认 3）
+                   - 尾部: 按 token 预算从后往前累积
+                   - 边界对齐: 不切断 tool_call/result 配对
+                   - 用户消息锚定: 确保最新用户消息一定在尾部
+          Phase 3: LLM 摘要 — 用辅助模型生成结构化摘要
+                   - 首次: 从零总结；后续: 迭代更新已有摘要
+                   - 支持 focus_topic 引导压缩
+          Phase 4: 消息组装 — 头 + 摘要消息 + 尾
+                   - 摘要消息插入到头部和尾部之间
+                   - 避免与邻居相同 role（防止 API 拒绝）
+                   - 在 system prompt 中注入压缩提示
+          Phase 5: 工具对修复 — 清理孤立的 tool_call/result
+                   - 删除缺少 tool_call 的 tool result
+                   - 为缺少 tool result 的 tool_call 插入 stub
 
-        After compression, orphaned tool_call / tool_result pairs are cleaned
-        up so the API never receives mismatched IDs.
+        返回压缩后的消息列表。如果消息太少无法压缩，返回原列表。
 
         Args:
-            focus_topic: Optional focus string for guided compression.  When
-                provided, the summariser will prioritise preserving information
-                related to this topic and be more aggressive about compressing
-                everything else.  Inspired by Claude Code's ``/compact``.
+            messages: 完整的 OpenAI 格式消息列表
+            current_tokens: 当前估算的 token 数（用于日志和反抖动）
+            focus_topic: 可选话题，优先保留相关信息（/compress <topic>）
         """
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)

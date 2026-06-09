@@ -7979,17 +7979,47 @@ class AIAgent:
                 messages.pop()
 
     def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None) -> tuple:
-        """压缩对话上下文并在 SQLite 中拆分会话。
+        """[上下文压缩入口] 压缩对话上下文 + 在 SQLite 中拆分会话。
 
-        Compress conversation context and split the session in SQLite.
+        这是 ContextCompressor.compress() 的上层包装，额外负责：
+
+        1. 压缩前：
+           - flush_memories(): 强制刷新当前内存，让记忆管理器在上下文丢失前保存
+           - memory_manager.on_pre_compress(): 通知外部记忆提供商（如 Honcho）
+             即将有上下文被丢弃，让它们有机会提取最终见解
+
+        2. 压缩中：
+           - context_compressor.compress(): 执行实际的消息列表压缩
+
+        3. 压缩后：
+           - todo_snapshot: 将当前 TODO 列表注入到压缩后的上下文中
+           - _invalidate_system_prompt(): 标记 system prompt 需重建
+           - _build_system_prompt(): 用新的压缩后的消息上下文重建 system prompt
+
+        4. 会话拆分（SQLite）:
+           - 结束旧 session (end_reason = "compression")
+           - 创建新 session (parent_session_id = 旧 session id)
+           - 标题自动编号: "my session" → "my session #2" → "my session #3"
+           - 在新的 session 中存储重建后的 system_prompt
+           - 重置 _last_flushed_db_idx = 0，后续消息写入新 session
+
+        5. 提示用户：
+           - 压缩 ≥2 次时警告 "accuracy may degrade. Consider /new"
+
+        会话链:
+          压缩创建的 session 链通过 parent_session_id 连接，
+          SessionDB.get_compression_tip() 可遍历链找到最新延续，
+          确保用户在 /sessions 列表中看到的是一条逻辑会话。
 
         Args:
-            focus_topic: Optional focus string for guided compression — the
-                summariser will prioritise preserving information related to
-                this topic.  Inspired by Claude Code's ``/compact <focus>``.
+            messages: 当前完整的消息列表
+            system_message: 原始 system prompt 文本
+            approx_tokens: 当前估算的 token 数
+            task_id: 任务标识
+            focus_topic: 可选话题（/compress <topic> 引导压缩）
 
         Returns:
-            (compressed_messages, new_system_prompt) tuple
+            (compressed_messages, new_system_prompt): 压缩后的消息列表和新的 system prompt
         """
         _pre_msg_count = len(messages)
         logger.info(
@@ -11767,24 +11797,30 @@ class AIAgent:
                     if _tc_names == {"execute_code"}:
                         self.iteration_budget.refund()
                     
-                    # 使用 API 响应中的实际 token 数来决定是否压缩。
-                    # prompt_tokens + completion_tokens 是提供商报告的
-                    # 实际上下文大小加上 assistant 轮次 — 是下一次 prompt
-                    # 的紧下界。上方追加的工具结果尚未计入，但阈值
-                    # （默认 50%）留有充足余量；若工具结果超出，
-                    # 下次 API 调用将报告真实总量并触发压缩。
+                    # ── 上下文压缩检查 ──
+                    # 工具执行完成后，检查是否需要压缩上下文。
                     #
-                    # 若 last_prompt_tokens 为 0（API 断连后过期或
-                    # 提供商未返回 usage 数据），回退到粗略估算
-                    # 以避免漏掉压缩。否则断连后会话会无限增长，
-                    # 因为 should_compress(0) 永远不会触发。(#2153)
+                    # Token 数的选择策略:
+                    #   使用 API 响应中的 prompt_tokens（而非 prompt_tokens + completion_tokens）。
+                    #
+                    #   原因：completion_tokens 和 reasoning_tokens 不占用上下文窗口空间——
+                    #   它们代表模型输出，不会传递给下一次 API 调用。
+                    #
+                    #   特别地，思考模型（GLM-5.1、QwQ、DeepSeek R1）会在推理阶段产生
+                    #   大量 completion_tokens（几十万 reasoning tokens），如果将其计入，
+                    #   会错误地过早触发压缩。只用 prompt_tokens 避免了这个问题。(#12026)
+                    #
+                    # 零值回退:
+                    #   若 last_prompt_tokens == 0（API 断连后状态过期，或提供商未返回
+                    #   usage 数据），回退到本地粗略估算 estimate_messages_tokens_rough()。
+                    #   否则断连后 should_compress(0) 永不触发，会话会无限增长（#2153）。
+                    #
+                    # 阈值余量:
+                    #   触发阈值默认 50% 上下文窗口，留有充足空间。此时刚追加的
+                    #   工具结果尚未计入 token 数——如果它们把总量推到超出窗口，
+                    #   下一次 API 调用会报告实际总量并触发压缩。
                     _compressor = self.context_compressor
                     if _compressor.last_prompt_tokens > 0:
-                        # 仅使用 prompt_tokens — completion/reasoning
-                        # token 不占用上下文窗口空间。
-                        # 思考模型（GLM-5.1、QwQ、DeepSeek R1）
-                        # 会因推理内容膨胀 completion_tokens，
-                        # 导致过早触发压缩。(#12026)
                         _real_tokens = _compressor.last_prompt_tokens
                     else:
                         _real_tokens = estimate_messages_tokens_rough(messages)
@@ -11797,9 +11833,9 @@ class AIAgent:
                             approx_tokens=self.context_compressor.last_prompt_tokens,
                             task_id=effective_task_id,
                         )
-                        # 压缩创建了新 session — 清除历史记录，
-                        # 使 _flush_messages_to_session_db 将压缩后的
-                        # 消息写入新 session (参见预检压缩注释)。
+                        # 压缩创建了新 session_id，旧 session 被标记为 end_reason='compression'。
+                        # 清除 conversation_history，使后续的 _flush_messages_to_session_db
+                        # 将压缩后的消息重新写入新 session（否则会追加到旧 session）。
                         conversation_history = None
                     
                     # 增量保存会话日志（即使中断也能看到进度）

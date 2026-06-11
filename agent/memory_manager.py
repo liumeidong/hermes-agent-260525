@@ -1,15 +1,59 @@
-"""MemoryManager — orchestrates the built-in memory provider plus at most
-ONE external plugin memory provider.
+"""MemoryManager — 内置 + 至多一个外部 provider 的统一编排器。
 
-Single integration point in run_agent.py. Replaces scattered per-backend
-code with one manager that delegates to registered providers.
+================================================================================
+架构概览
+================================================================================
+MemoryManager 是 Hermes 记忆系统的唯一集成点（run_agent.py 通过它调用所有记忆功能）。
 
-The BuiltinMemoryProvider is always registered first and cannot be removed.
-Only ONE external (non-builtin) provider is allowed at a time — attempting
-to register a second external provider is rejected with a warning.  This
-prevents tool schema bloat and conflicting memory backends.
+它协调两类 provider：
+  - BuiltinMemoryProvider：始终启用，不可移除，管理 MEMORY.md/USER.md
+  - 外部插件 provider：最多一个（Honcho/Mem0/Hindsight/Supermemory 等）
 
-Usage in run_agent.py:
+设计目的：
+  1. 单一接口：run_agent.py 只需与 MemoryManager 交互，不需要了解各 provider 细节
+  2. 故障隔离：单个 provider 失败不会阻断其他 provider
+  3. 桥接能力：内置 memory 写入时自动通知外部 provider
+
+================================================================================
+双层记忆策略
+================================================================================
+内置层（BuiltinMemoryProvider）：
+  - 容量小（MEMORY.md 2200 chars, USER.md 1375 chars）
+  - 启动时全量加载到 system prompt（冻结快照）
+  - 保证关键事实永不被遗漏
+
+外部层（External Provider）：
+  - 容量大（可达 MB 级）
+  - 每轮对话前按 query 动态检索
+  - 仅相关内容注入到 user message 前
+
+两者互补：内置保证基础事实，外部提供历史上下文。
+
+================================================================================
+加载策略对比
+================================================================================
+内置（system prompt 注入）：
+  load_from_disk() → 启动时全量读取 + 精确去重 + 冻结快照
+  注入位置：system prompt（会话期间永不变，保护 prefix cache）
+
+外部（user message 前注入）：
+  prefetch(query) → 每轮对话前基于当前 query 语义检索
+  注入位置：<memory-context> 标签包裹，注入到 user message 前
+
+================================================================================
+矛盾解决机制
+================================================================================
+内置记忆的矛盾处理完全由 LLM 自主决策：
+  - 模型检测到矛盾时调用 replace（短子串匹配定位）
+  - 模型发现事实不再成立时调用 remove
+  - 字符上限满时强制 add 失败，要求先 replace/remove
+  - 仅 CLI 提供 hermes memory reset 全局擦除
+
+外部 provider 可能有更高级能力（Honcho 自动检测矛盾、Mem0 语义去重）。
+
+================================================================================
+使用模式（run_agent.py）：
+
     self._memory_manager = MemoryManager()
     self._memory_manager.add_provider(BuiltinMemoryProvider(...))
     # Only ONE of these:
@@ -81,10 +125,20 @@ def build_memory_context_block(raw_context: str) -> str:
 
 
 class MemoryManager:
-    """Orchestrates the built-in provider plus at most one external provider.
+    """编排内置 provider + 至多一个外部 provider。
 
-    The builtin provider is always first. Only one non-builtin (external)
-    provider is allowed.  Failures in one provider never block the other.
+    关键设计：
+      - 内置 provider（name == "builtin"）始终存在，不可移除
+      - 外部 provider 最多同时激活一个（防止 tool schema 膨胀）
+      - 单个 provider 失败不会阻断其他 provider
+
+    加载策略：
+      - 内置 provider：启动时全量加载（MemoryStore.load_from_disk）
+      - 外部 provider：每轮 prefetch_all 时动态检索
+
+    矛盾解决：
+      - 内置层无自动检测，由 LLM 通过 memory 工具自主处理
+      - 外部 provider 可提供高级能力（自动矛盾检测、语义去重）
     """
 
     def __init__(self) -> None:

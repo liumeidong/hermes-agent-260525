@@ -4332,7 +4332,58 @@ class AIAgent:
         """
         组装完整系统提示词，按层级叠加。
 
-        [中文] 组装完整系统提示词，按层级叠加:
+        ═══════════════════════════════════════════════════════════════════════
+        系统提示词构建架构
+        ═══════════════════════════════════════════════════════════════════════
+
+        [整体架构]
+
+            ┌─────────────────────────────────────────────────────────┐
+            │              _build_system_prompt() 构建                │
+            │         (缓存到 _cached_system_prompt, 会话内稳定)       │
+            │                                                         │
+            │  Layer 1:  Agent 身份 (SOUL.md / DEFAULT_AGENT_IDENTITY)│
+            │  Layer 2:  工具感知行为指导 (memory/skills/session)      │
+            │  Layer 3:  Nous 订阅提示                                │
+            │  Layer 4:  工具使用强制 (tool_use_enforcement)           │
+            │  Layer 5:  用户/网关 system_message (如提供)             │
+            │  Layer 6:  持久记忆快照 (MEMORY.md + USER.md)           │
+            │  Layer 7:  外部记忆提供商 (Honcho/Mem0 等)              │
+            │  Layer 8:  技能清单索引 (可用技能列表)                   │
+            │  Layer 9:  上下文文件 (AGENTS.md, .cursorrules 等)      │
+            │  Layer 10: 时间戳/元数据 (日期, session, model, provider)│
+            │  Layer 11: 环境提示 (WSL, Termux 等)                    │
+            │  Layer 12: 平台格式提示 (WhatsApp/Telegram 等)          │
+            └─────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+            ┌─────────────────────────────────────────────────────────┐
+            │          API 调用时拼接 (每次请求动态组合)               │
+            │                                                         │
+            │  effective_system = _cached_system_prompt                │
+            │                  + "\n\n" + ephemeral_system_prompt     │
+            │                                                         │
+            │  → 注入为 messages[0] (role=system)                     │
+            └─────────────────────────────────────────────────────────┘
+
+        [ephemeral_system_prompt 设计]
+
+            ephemeral_system_prompt 是"临时系统提示"，只在 API 调用时追加，
+            不写入 _cached_system_prompt。这样做的目的是保护 Anthropic prompt
+            caching —— Anthropic 的缓存基于 system prompt 前缀匹配，如果每次
+            请求前缀不同，缓存就会失效。
+
+            因此稳定的缓存前缀 (_cached_system_prompt) 和临时追加
+            (ephemeral_system_prompt) 分离，确保缓存命中率最大化。
+
+        [缓存策略]
+
+            - _build_system_prompt() 只构建一次，结果缓存到 _cached_system_prompt
+            - 上下文压缩 (context compression) 后才重建
+            - 这确保系统提示在会话内稳定，最大化 Anthropic 前缀缓存命中率
+
+        [层级说明]
+
           1. Agent 身份 — SOUL.md (自定义人格) 或 DEFAULT_AGENT_IDENTITY (硬编码默认)
           2. 工具感知行为指导 — MEMORY_GUIDANCE / SESSION_SEARCH_GUIDANCE / SKILLS_GUIDANCE
           3. 用户/网关系统提示 (如提供)
@@ -4343,18 +4394,10 @@ class AIAgent:
           8. 时间戳/元数据 — 日期、会话 ID、模型名、提供商
           9. 环境提示 — WSL, Termux 检测
          10. 平台提示 — WhatsApp(无markdown), Telegram(原生markdown) 等格式指导
-
-        只构建一次(缓存到 _cached_system_prompt)，上下文压缩后才重建。
-        这确保系统提示在会话内稳定，最大化 Anthropic 前缀缓存命中率。
         """
-        # 层级 (按顺序):
-        #   1. Agent 身份 — SOUL.md 可用时使用，否则使用 DEFAULT_AGENT_IDENTITY
-        #   2. 用户 / 网关系统提示 (如提供)
-        #   3. 持久记忆 (冻结快照)
-        #   4. 技能指导 (如已加载技能工具)
-        #   5. 上下文文件 (AGENTS.md, .cursorrules — 当 SOUL.md 作为身份时在此排除)
-        #   6. 当前日期与时间 (构建时冻结)
-        #   7. 平台特定格式提示
+        # ── Layer 1: Agent 身份 ──────────────────────────────────────
+        # 优先加载 SOUL.md 自定义人格；未找到时回退到 DEFAULT_AGENT_IDENTITY。
+        # skip_context_files=True 时跳过 SOUL.md（用于批量模式等场景）。
 
         # 尝试 SOUL.md 作为主要身份 (除非跳过上下文文件)
         _soul_loaded = False
@@ -4368,7 +4411,8 @@ class AIAgent:
             # 回退到硬编码身份
             prompt_parts = [DEFAULT_AGENT_IDENTITY]
 
-        # 工具感知行为指导: 仅在工具加载时注入
+        # ── Layer 2: 工具感知行为指导 ─────────────────────────────────
+        # 仅在对应工具已加载时注入对应指导，避免提示无关工具的行为规范。
         tool_guidance = []
         if "memory" in self.valid_tool_names:
             tool_guidance.append(MEMORY_GUIDANCE)
@@ -4379,10 +4423,13 @@ class AIAgent:
         if tool_guidance:
             prompt_parts.append(" ".join(tool_guidance))
 
+        # ── Layer 3: Nous 订阅提示 ────────────────────────────────────
         nous_subscription_prompt = build_nous_subscription_prompt(self.valid_tool_names)
         if nous_subscription_prompt:
             prompt_parts.append(nous_subscription_prompt)
-        # 工具使用强制: 告诉模型实际调用工具而不是
+
+        # ── Layer 4: 工具使用强制 ────────────────────────────────────
+        # 告诉模型实际调用工具而不是
         # 描述意图操作。由 config.yaml 控制
         # agent.tool_use_enforcement：
         #   "auto" (默认) — 匹配 TOOL_USE_ENFORCEMENT_MODELS
@@ -4417,11 +4464,14 @@ class AIAgent:
 
         # 以便将用户引导到已有答案而非重新生成。
 
+        # ── Layer 5: 用户/网关 system_message ────────────────────────
         # 注意: ephemeral_system_prompt 不在此包含。仅在 API 调用时
         # 注入，以便保持缓存/存储的系统提示不变。
         if system_message is not None:
             prompt_parts.append(system_message)
 
+        # ── Layer 6: 持久记忆快照 ────────────────────────────────────
+        # MEMORY.md (agent 记忆) + USER.md (用户画像)，构建时冻结。
         if self._memory_store:
             if self._memory_enabled:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
@@ -4433,7 +4483,8 @@ class AIAgent:
                 if user_block:
                     prompt_parts.append(user_block)
 
-        # 外部记忆提供商系统提示块 (对内置的补充)
+        # ── Layer 7: 外部记忆提供商 ──────────────────────────────────
+        # Honcho, Mem0 等插件的记忆区块，对内置 MEMORY.md 的补充。
         if self._memory_manager:
             try:
                 _ext_mem_block = self._memory_manager.build_system_prompt()
@@ -4442,6 +4493,8 @@ class AIAgent:
             except Exception:
                 pass
 
+        # ── Layer 8: 技能清单索引 ────────────────────────────────────
+        # 可用技能列表供模型发现和调用。
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
         if has_skills_tools:
             avail_toolsets = {
@@ -4460,6 +4513,9 @@ class AIAgent:
         if skills_prompt:
             prompt_parts.append(skills_prompt)
 
+        # ── Layer 9: 上下文文件 ──────────────────────────────────────
+        # AGENTS.md, .cursorrules, HERMES.md 等项目级指导文件。
+        # SOUL.md 已在 Layer 1 加载时在此排除，避免重复。
         if not self.skip_context_files:
             # 设置时使用 TERMINAL_CWD 进行上下文文件发现 (网关
             # 模式)。网关进程从 hermes-agent 安装目录运行，
@@ -4471,6 +4527,8 @@ class AIAgent:
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
 
+        # ── Layer 10: 时间戳/元数据 ──────────────────────────────────
+        # 构建时冻结的日期、会话 ID、模型名、提供商。
         from hermes_time import now as _hermes_now
         now = _hermes_now()
         timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
@@ -4482,6 +4540,7 @@ class AIAgent:
             timestamp_line += f"\nProvider: {self.provider}"
         prompt_parts.append(timestamp_line)
 
+        # ── Layer 10.1: 模型身份修正 (Alibaba API bug workaround) ────
         # Alibaba Coding Plan API 始终返回 "glm-4.7" 作为模型名，不管
         # 请求的模型是什么。将明确的模型身份注入系统提示
         # 以便 agent 正确报告其模型 (绕过 API bug)。
@@ -4494,12 +4553,14 @@ class AIAgent:
                 f"not on any model name returned by the API."
             )
 
-        # 环境提示 (WSL, Termux 等) — 告诉 agent 执行环境信息
-        # 以便转换路径并适应行为。
+        # ── Layer 11: 环境提示 ───────────────────────────────────────
+        # WSL, Termux 等特殊执行环境检测，告知 agent 路径转换和行为适配。
         _env_hints = build_environment_hints()
         if _env_hints:
             prompt_parts.append(_env_hints)
 
+        # ── Layer 12: 平台格式提示 ──────────────────────────────────
+        # WhatsApp(禁用 markdown)、Telegram(原生 markdown) 等格式适配。
         platform_key = (self.platform or "").lower().strip()
         if platform_key in PLATFORM_HINTS:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
@@ -4710,13 +4771,13 @@ class AIAgent:
         return _codex_derive_responses_function_call_id(call_id, response_item_id)
 
     def _thread_identity(self) -> str:
-        """返回当前线程标识字符串（线程名:线程ID）。
+        """返回当前线程标识字符串（线程名:线程ID）。 """
 
         thread = threading.current_thread()
-        return f"{thread.name}:{thread.ident}"
+        return f"{thread.name}:{thread.ident}
 
     def _client_log_context(self) -> str:
-        """返回客户端日志上下文字符串（provider/base_url/model）。
+        """返回客户端日志上下文字符串（provider/base_url/model） """
 
         provider = getattr(self, "provider", "unknown")
         base_url = getattr(self, "base_url", "unknown")
@@ -4727,7 +4788,7 @@ class AIAgent:
         )
 
     def _openai_client_lock(self) -> threading.RLock:
-        """返回线程安全的 OpenAI 客户端锁（RLock）。
+        """返回线程安全的 OpenAI 客户端锁（RLock） """
 
         lock = getattr(self, "_client_lock", None)
         if lock is None:
